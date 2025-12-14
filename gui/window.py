@@ -3675,6 +3675,9 @@ class MainWindow:
             if self.scan_stop_flag:
                 return
             
+            # Mark as processed at the end (in finally block)
+            target_processed = False
+            
             # Update current scanning URL
             self.root.after(0, lambda url=base_url, idx=idx, total=total: 
                           self.scan_current_url_var.set(f"[{idx}/{total}] {url}"))
@@ -3845,6 +3848,7 @@ class MainWindow:
                                   self._update_scan_output_error(
                         idx, total, base_url, error_first_line
                     ))
+                target_processed = True
                 return
             
             # Validate command results - filter out invalid outputs (> 50 chars)
@@ -3873,6 +3877,7 @@ class MainWindow:
                               self._update_scan_output_vulnerable(
                                   idx, total, base_url, command_results
                               ))
+                target_processed = True
                 return
             
             # If all outputs are invalid (> 50 chars), treat as not vulnerable
@@ -3881,6 +3886,7 @@ class MainWindow:
                 error_msg = "Output tidak valid (panjang > 50 karakter)"
                 self.root.after(0, lambda idx=idx, total=total, base_url=base_url, msg=error_msg: 
                               self._update_scan_output_not_vulnerable(idx, total, base_url, msg))
+                target_processed = True
                 return
                 
             # If we reach here, all commands failed or no commands succeeded
@@ -3948,6 +3954,7 @@ class MainWindow:
             """Scan targets in batches."""
             try:
                 total = len(targets)
+                processed_count = [0]  # Track processed targets
                 
                 if use_multithread and num_threads > 1 and batch_size > 1:
                     # Batch-based multi-threaded scanning
@@ -3989,6 +3996,7 @@ class MainWindow:
                                 future = executor.submit(scan_single_target, base_url, original, idx, total)
                                 futures.append(future)
                                 self.scan_futures.append(future)  # Store for cancellation
+                                processed_count[0] += 1  # Count as processed when submitted
                             
                             # Wait for all targets in this batch to complete
                             # Use as_completed with proper error handling to ensure all targets are processed
@@ -4033,9 +4041,10 @@ class MainWindow:
                                     if remaining_futures:
                                         time.sleep(0.1)  # Small delay before checking again
                                 
-                                # If still have remaining futures, cancel them
+                                # If still have remaining futures, cancel them (but count as processed)
                                 for f in remaining_futures:
                                     f.cancel()
+                                    processed_count[0] += 1  # Count cancelled as processed (user stopped)
                         finally:
                             # Verify all futures are done before shutdown
                             import time
@@ -4070,6 +4079,8 @@ class MainWindow:
                     for idx, (base_url, original) in enumerate(targets, 1):
                         if self.scan_stop_flag:
                             break
+                        
+                        processed_count[0] += 1  # Count each target as processed
                         
                         # Update progress and current URL
                         self.root.after(0, lambda idx=idx, total=total, base_url=base_url: 
@@ -4181,6 +4192,11 @@ class MainWindow:
                         
                         except Exception as e:
                             error_msg = str(e)
+                        
+                        # Ensure error_msg is initialized
+                        if 'error_msg' not in locals() or error_msg is None:
+                            error_msg = "Unknown error"
+                        
                         error_first_line = error_msg.split('\n')[0].strip()
                         if len(error_first_line) > 150:
                             error_first_line = error_first_line[:147] + "..."
@@ -4237,9 +4253,18 @@ class MainWindow:
                 final_vuln = vulnerable_count[0]
                 final_not_vuln = not_vulnerable_count[0]
                 final_error = error_count[0]
+                final_processed = processed_count[0]
+                
+                # Verify all targets were processed
+                if final_processed < total and not self.scan_stop_flag:
+                    # Some targets were not processed - log warning
+                    missing = total - final_processed
+                    print(f"WARNING: {missing} target(s) were not processed (processed: {final_processed}/{total})")
+                    # Update error count to include missing targets
+                    final_error += missing
                 
                 self.root.after(0, lambda: self._finalize_scan_results(
-                    total, final_vuln, final_not_vuln, final_error
+                    total, final_vuln, final_not_vuln, final_error, final_processed
                 ))
                 
             except Exception as e:
@@ -4356,8 +4381,21 @@ class MainWindow:
         self.scan_not_vuln_output.insert(tk.END, "\n" + "─" * 60 + "\n\n")
         self.scan_not_vuln_output.see(tk.END)
     
-    def _finalize_scan_results(self, total: int, vulnerable_count: int, not_vulnerable_count: int, error_count: int):
+    def _finalize_scan_results(self, total: int, vulnerable_count: int, not_vulnerable_count: int, error_count: int, processed_count: int = None):
         """Finalize scan results (called from main thread)."""
+        # Use processed_count if provided, otherwise use total
+        if processed_count is None:
+            processed_count = total
+        
+        # Verify all targets were processed
+        if processed_count < total:
+            # Some targets were not processed - add warning
+            missing = total - processed_count
+            self.scan_not_vuln_output.insert(tk.END, "=" * 60 + "\n")
+            self.scan_not_vuln_output.insert(tk.END, f"⚠️  WARNING: {missing} target(s) were not processed!\n", "error")
+            self.scan_not_vuln_output.insert(tk.END, f"Total targets: {total}, Processed: {processed_count}\n", "error")
+            self.scan_not_vuln_output.see(tk.END)
+        
         # Add summary to vulnerable output
         if vulnerable_count > 0:
             self.scan_vuln_output.insert(tk.END, "=" * 60 + "\n")
@@ -4370,6 +4408,8 @@ class MainWindow:
             summary_text = f"SUMMARY: {not_vulnerable_count} not vulnerable"
             if error_count > 0:
                 summary_text += f", {error_count} error(s)"
+            if processed_count < total:
+                summary_text += f" (Processed: {processed_count}/{total})"
             self.scan_not_vuln_output.insert(tk.END, f"{summary_text}\n", "not_vulnerable")
             self.scan_not_vuln_output.see(tk.END)
         
@@ -4382,9 +4422,10 @@ class MainWindow:
         
         # Show completion message only if not stopped
         if not self.scan_stop_flag:
-            messagebox.showinfo("Scan Selesai", 
-                          f"Scan selesai!\n\nVulnerable: {vulnerable_count}\nNot Vulnerable: {not_vulnerable_count}\nError: {error_count}",
-                          parent=self.root)
+            message_text = f"Scan selesai!\n\nTotal: {total}\nProcessed: {processed_count}\nVulnerable: {vulnerable_count}\nNot Vulnerable: {not_vulnerable_count}\nError: {error_count}"
+            if processed_count < total:
+                message_text += f"\n\n⚠️  WARNING: {total - processed_count} target(s) tidak terproses!"
+            messagebox.showinfo("Scan Selesai", message_text, parent=self.root)
     
     def _handle_paste_urls(self, event):
         """Handle paste event and auto-format URLs into separate lines."""
