@@ -3095,9 +3095,23 @@ class MainWindow:
         file_btn_frame = ttk.Frame(config_frame)
         file_btn_frame.pack(fill=tk.X, pady=2)
         ttk.Label(file_btn_frame, text="Input:").pack(side=tk.LEFT, padx=5)
-        get_file_btn = ttk.Button(file_btn_frame, text="Get from File", 
+        get_file_btn = ttk.Button(file_btn_frame, text="Get from File(s)", 
                                   command=self._get_file_for_extractor)
         get_file_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Selected files display
+        self.extractor_selected_files_var = tk.StringVar(value="No files selected")
+        selected_files_label = ttk.Label(file_btn_frame, textvariable=self.extractor_selected_files_var, 
+                                        font=('TkDefaultFont', 8), foreground='gray')
+        selected_files_label.pack(side=tk.LEFT, padx=10)
+        
+        # Clear files button
+        clear_files_btn = ttk.Button(file_btn_frame, text="Clear Files", 
+                                     command=self._clear_extractor_files)
+        clear_files_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Store selected files
+        self.extractor_selected_files = []
         
         # Input list area
         input_frame = ttk.LabelFrame(parent, text="Input List", padding=5)
@@ -3136,7 +3150,7 @@ class MainWindow:
         self.extracted_urls = []
     
     def _get_file_for_extractor(self):
-        """Get file content and populate input area."""
+        """Get file(s) for extraction - supports multiple file selection."""
         filetypes = [
             ("All supported", "*.txt;*.pdf;*.docx;*.xlsx;*.xls;*.csv;*.py;*.js;*.java;*.cpp;*.c;*.php;*.rb;*.go;*.rs;*.ts;*.html;*.xml;*.json"),
             ("Text files", "*.txt"),
@@ -3148,22 +3162,37 @@ class MainWindow:
             ("All files", "*.*")
         ]
         
-        filename = filedialog.askopenfilename(
-            title="Pilih file untuk extract URL",
+        filenames = filedialog.askopenfilenames(
+            title="Pilih file(s) untuk extract URL (bisa multiple)",
             filetypes=filetypes
         )
         
-        if not filename:
+        if not filenames:
             return
         
-        try:
-            content = self._read_file_content(filename)
-            if content:
-                self.extractor_input_text.delete('1.0', tk.END)
-                self.extractor_input_text.insert('1.0', content)
-                messagebox.showinfo("Success", f"File loaded: {os.path.basename(filename)}", parent=self.root)
-        except Exception as e:
-            messagebox.showerror("Error", f"Gagal membaca file:\n{str(e)}", parent=self.root)
+        # Store selected files
+        self.extractor_selected_files = list(filenames)
+        
+        # Update display
+        if len(self.extractor_selected_files) == 1:
+            self.extractor_selected_files_var.set(f"1 file: {os.path.basename(self.extractor_selected_files[0])}")
+        else:
+            self.extractor_selected_files_var.set(f"{len(self.extractor_selected_files)} files selected")
+        
+        # Clear input text (will be processed when user clicks Process)
+        self.extractor_input_text.delete('1.0', tk.END)
+        self.extractor_input_text.insert('1.0', f"Selected {len(self.extractor_selected_files)} file(s). Click 'Process' to extract URLs.\n\n")
+        for i, fname in enumerate(self.extractor_selected_files, 1):
+            self.extractor_input_text.insert(tk.END, f"{i}. {os.path.basename(fname)}\n")
+    
+    def _clear_extractor_files(self):
+        """Clear selected files."""
+        self.extractor_selected_files = []
+        self.extractor_selected_files_var.set("No files selected")
+        self.extractor_input_text.delete('1.0', tk.END)
+        self.extractor_output_text.delete('1.0', tk.END)
+        self.extracted_urls = []
+        self.extractor_info_var.set("")
     
     def _read_file_content(self, filename: str) -> str:
         """Read content from various file formats."""
@@ -3236,92 +3265,156 @@ class MainWindow:
                 return f.read()
     
     def _process_url_extraction(self):
-        """Process URL extraction based on selected format."""
-        input_content = self.extractor_input_text.get('1.0', tk.END).strip()
-        if not input_content:
-            messagebox.showerror("Error", "Input list kosong", parent=self.root)
-            return
-        
+        """Process URL extraction based on selected format - supports multiple files."""
         format_type = self.extractor_format_var.get()
         self.extracted_urls = []
+        
+        # Check if files are selected
+        if not self.extractor_selected_files:
+            # Fallback to manual input if no files selected
+            input_content = self.extractor_input_text.get('1.0', tk.END).strip()
+            if not input_content:
+                messagebox.showerror("Error", "Pilih file(s) terlebih dahulu atau masukkan input manual", parent=self.root)
+                return
+            
+            # Process manual input (single content)
+            self._process_single_content(input_content, format_type)
+            return
+        
+        # Process multiple files
+        self.extractor_output_text.delete('1.0', tk.END)
+        self.extractor_output_text.insert('1.0', f"Processing {len(self.extractor_selected_files)} file(s)...\n\n")
+        
+        total_urls = 0
+        processed_count = 0
+        
+        for file_idx, filename in enumerate(self.extractor_selected_files, 1):
+            try:
+                # Update progress in output
+                file_basename = os.path.basename(filename)
+                self.extractor_output_text.insert(tk.END, f"[{file_idx}/{len(self.extractor_selected_files)}] Processing: {file_basename}...\n")
+                self.extractor_output_text.see(tk.END)
+                self.root.update_idletasks()
+                
+                # Read file content
+                content = self._read_file_content(filename)
+                if not content:
+                    self.extractor_output_text.insert(tk.END, f"  ⚠️  Warning: File kosong atau tidak bisa dibaca\n\n")
+                    continue
+                
+                # Process this file's content
+                file_urls = self._extract_urls_from_content(content, format_type)
+                
+                if file_urls:
+                    # Append URLs from this file
+                    self.extracted_urls.extend(file_urls)
+                    total_urls += len(file_urls)
+                    self.extractor_output_text.insert(tk.END, f"  ✓ Found {len(file_urls)} URL(s)\n\n")
+                else:
+                    self.extractor_output_text.insert(tk.END, f"  ⚠️  No URLs found\n\n")
+                
+                processed_count += 1
+                
+            except Exception as e:
+                self.extractor_output_text.insert(tk.END, f"  ✗ Error: {str(e)}\n\n")
+                continue
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_urls = []
+        for url in self.extracted_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        self.extracted_urls = unique_urls
+        
+        # Display final results
+        self.extractor_output_text.insert(tk.END, "=" * 60 + "\n")
+        self.extractor_output_text.insert(tk.END, f"SUMMARY:\n")
+        self.extractor_output_text.insert(tk.END, f"  Files processed: {processed_count}/{len(self.extractor_selected_files)}\n")
+        self.extractor_output_text.insert(tk.END, f"  Total URLs found: {len(self.extracted_urls)} (after deduplication)\n")
+        self.extractor_output_text.insert(tk.END, "=" * 60 + "\n\n")
+        
+        # Display all extracted URLs
+        if self.extracted_urls:
+            output_text = '\n'.join(self.extracted_urls)
+            self.extractor_output_text.insert(tk.END, output_text)
+            
+            # Update info label
+            self.extractor_info_var.set(f"Total row ditemukan: {len(self.extracted_urls)}")
+            
+            messagebox.showinfo("Success", 
+                              f"Extraction selesai!\n\nFiles processed: {processed_count}/{len(self.extractor_selected_files)}\nUnique URLs: {len(self.extracted_urls)}", 
+                              parent=self.root)
+        else:
+            self.extractor_output_text.insert(tk.END, "No URLs found in any file")
+            self.extractor_info_var.set("Total row ditemukan: 0")
+            messagebox.showwarning("Warning", "Tidak ada URL yang ditemukan dari semua file", parent=self.root)
+        
+        self.extractor_output_text.see(tk.END)
+    
+    def _extract_urls_from_content(self, content: str, format_type: str) -> list:
+        """Extract URLs from content based on format type."""
+        extracted = []
         
         try:
             if format_type == "Fofa CSV":
                 # Extract from Fofa CSV format: host,ip,port,protocol,domain,link
-                # Process like Excel: Text to Column with comma delimiter, then take LINK column
-                lines = input_content.split('\n')
+                lines = content.split('\n')
                 
                 for line in lines:
                     line = line.strip()
                     if not line:
                         continue
                     
-                    # Skip header row (host,ip,port,protocol,domain,link)
+                    # Skip header row
                     if line.lower().startswith('host,ip,port,protocol,domain,link') or \
                        (line.lower().startswith('host,') and 'link' in line.lower()):
                         continue
                     
-                    # Split by comma (Text to Column with comma delimiter)
-                    # Handle CSV properly - split by comma
+                    # Split by comma
                     parts = line.split(',')
                     parts = [p.strip() for p in parts]
                     
-                    # Fofa CSV format: host,ip,port,protocol,domain,link
-                    # Column order: 0=host, 1=ip, 2=port, 3=protocol, 4=domain, 5=link
-                    # We want ONLY column 5 (LINK column)
+                    # Get LINK column (index 5)
                     if len(parts) >= 6:
-                        # Get LINK column (index 5)
-                        link = parts[5].strip()
-                        
-                        # Clean the link (remove quotes if any)
-                        link = link.strip('"').strip("'").strip()
-                        
-                        # Only add if it's a valid URL
-                        if link and (link.startswith('http://') or link.startswith('https://')):
-                            self.extracted_urls.append(link)
-                    elif len(parts) == 6:
-                        # Sometimes there might be trailing comma, handle it
                         link = parts[5].strip().strip('"').strip("'").strip()
                         if link and (link.startswith('http://') or link.startswith('https://')):
-                            self.extracted_urls.append(link)
+                            extracted.append(link)
             else:
-                # Default format: extract URLs from text and normalize to host:port format
+                # Default format: extract URLs from text and normalize
                 import re
                 import urllib.parse
                 
-                # Pattern to match full URLs with protocol
                 url_pattern = re.compile(r'https?://[^\s<>"\'\[\](){}]+', re.IGNORECASE)
-                urls = url_pattern.findall(input_content)
+                urls = url_pattern.findall(content)
                 
-                # Normalize URLs: extract only host and port
-                normalized_urls = []
+                # Normalize URLs
                 for url in urls:
                     try:
                         parsed = urllib.parse.urlparse(url)
                         if parsed.hostname:
-                            # Build normalized URL: protocol://host:port (or just protocol://host if no port)
                             if parsed.port:
-                                # Custom port
                                 normalized = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
                             else:
-                                # Default port (80 for http, 443 for https)
                                 normalized = f"{parsed.scheme}://{parsed.hostname}"
-                            normalized_urls.append(normalized)
+                            extracted.append(normalized)
                     except Exception:
-                        # If parsing fails, skip this URL
                         continue
-                
-                # Remove duplicates while preserving order
-                seen = set()
-                unique_urls = []
-                for url in normalized_urls:
-                    if url not in seen:
-                        seen.add(url)
-                        unique_urls.append(url)
-                
-                self.extracted_urls = unique_urls
+        
+        except Exception as e:
+            # Return empty list on error
+            pass
+        
+        return extracted
+    
+    def _process_single_content(self, content: str, format_type: str):
+        """Process single content (manual input or single file) - legacy support."""
+        try:
+            self.extracted_urls = self._extract_urls_from_content(content, format_type)
             
-            # Remove duplicates while preserving order
+            # Remove duplicates
             seen = set()
             unique_urls = []
             for url in self.extracted_urls:
@@ -3336,18 +3429,14 @@ class MainWindow:
             if self.extracted_urls:
                 output_text = '\n'.join(self.extracted_urls)
                 self.extractor_output_text.insert('1.0', output_text)
-                
-                # Update info label next to Copy All button
                 self.extractor_info_var.set(f"Total row ditemukan: {len(self.extracted_urls)}")
-                
                 messagebox.showinfo("Success", f"Extracted {len(self.extracted_urls)} unique URLs", parent=self.root)
             else:
                 self.extractor_output_text.insert('1.0', "No URLs found")
-                
-                # Update info label
                 self.extractor_info_var.set("Total row ditemukan: 0")
-                
                 messagebox.showwarning("Warning", "Tidak ada URL yang ditemukan", parent=self.root)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error saat processing:\n{str(e)}", parent=self.root)
         
         except Exception as e:
             messagebox.showerror("Error", f"Gagal extract URL:\n{str(e)}", parent=self.root)
